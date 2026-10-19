@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# What "passing" means for this project. Every pull request must pass it before it merges, the author
+# runs it before finishing, and the check job runs it on every change. The owner approves changes to it.
+#
+# Until the project says otherwise, it runs the usual checks for what it finds. Replace it with the
+# project's own commands as soon as there are any: the factory proposes that first.
+set -euo pipefail
+ran=""
+if [ -f pyproject.toml ] || [ -f setup.py ]; then
+  if [ -f uv.lock ]; then uv run --all-extras --with pytest pytest -q; else uv run --with pytest pytest -q; fi
+  ran=python
+fi
+if [ -f package.json ]; then
+  if [ -f package-lock.json ]; then npm ci; else npm install; fi
+  npm test
+  ran="$ran node"
+fi
+if [ -f go.mod ]; then go test ./...; ran="$ran go"; fi
+if [ -f Cargo.toml ]; then cargo test; ran="$ran rust"; fi
+if [ -z "$ran" ]; then
+  echo "No project checks yet: nothing to run. The factory's first plan writes them."
+fi

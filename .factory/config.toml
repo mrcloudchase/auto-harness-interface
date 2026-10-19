@@ -1,0 +1,21 @@
+# The factory's limits, and what only the owner approves. The owner's file: a change to it by the
+# factory waits for the owner's approval. Every key is optional; these are the defaults.
+
+branch = "main"                  # where work lands
+budget_usd_per_day = 20.0        # reported model spend; a turn starts only while today's is under it
+turns_per_day = 40               # agent turns a day, whatever they report costing: the hard brake
+tries = 3                        # author turns on one issue before it goes to the owner
+open_prs = 3                     # the factory's pull requests open at once
+plan_every_hours = 24            # how often to plan when nothing is planned; a VISION.md change plans at once
+digest_every_days = 7            # the owner's digest
+improve_every_days = 7           # the factory's retrospective on itself
+
+# Hosts the agents' sandbox may reach besides their model providers: package indexes, so they can
+# install what the project needs and run its checks. Empty means providers only.
+egress = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+
+# A pull request that changes any of these merges only after the owner approves it.
+owner_paths = ["VISION.md", ".factory/loop.py", ".factory/check", ".factory/config.toml", ".github/*"]
+
+# Deleting a file that matches these is never accepted.
+test_paths = ["test/*", "tests/*", "*/test/*", "*/tests/*", "test_*", "*/test_*", "*_test.*", "*.test.*", "*.spec.*"]
