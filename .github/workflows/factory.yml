@@ -1,0 +1,139 @@
+# The software factory. Three jobs, each with only what it needs:
+#   tick   runs .factory/loop.py: reads GitHub, does one thing, records it. It holds the GitHub token
+#          and starts harness-interface for the agents; it never runs the project's own code.
+#   check  runs the project's checks on one commit: read-only, no secrets. Its result is the `check`
+#          every pull request needs before it merges.
+#   next   starts a tick when a check finishes, so the loop sees the result at once.
+# The factory's own actions start no workflow (GitHub's rule for its token), so it starts this one by
+# dispatch. Ticks never overlap. Paused unless the repository variable FACTORY_ENABLED is `true`.
+# See .factory/README.md.
+name: factory
+
+# A tick starts when you start it, open an issue, or write on an issue or pull request in any state; only
+# your own issues and words start one. It keeps going, tick after tick, until there is nothing to do, it
+# needs you, or a brake stops it. To also run on its own, uncomment the lines marked `auto`.
+on:
+  workflow_dispatch:                                           # Actions -> factory -> Run workflow
+    inputs:
+      task: { description: "tick, check, digest (write it now) or improve (retrospective now)", default: tick }
+  issues: { types: [opened] }                                  # you open an issue
+  issue_comment: { types: [created] }                          # you comment on an issue or a pull request
+  pull_request_review: { types: [submitted] }                  # you review a pull request
+  pull_request_review_comment: { types: [created] }            # you comment on a pull request's lines
+  pull_request: { types: [opened, synchronize, reopened] }    # the check on your own pull requests
+  # schedule: [{ cron: "17 * * * *" }]                         # auto: a tick every hour
+  # push: { branches: [main] }                                 # auto: a tick when you push, say VISION.md
+
+permissions: {}
+
+env:
+  HI_VERSION: v1.0.5                            # the harness-interface release the agents run on
+  OWNER: ${{ vars.FACTORY_OWNER || github.repository_owner }}
+
+jobs:
+  tick:
+    if: >-
+      vars.FACTORY_ENABLED == 'true' && github.event_name != 'pull_request' &&
+      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.task != 'check') ||
+       github.event.sender.login == (vars.FACTORY_OWNER || github.repository_owner))
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency: { group: factory-tick, cancel-in-progress: false }
+    permissions: { contents: write, issues: write, pull-requests: write, statuses: write, actions: write, checks: read }
+    steps:
+      - uses: actions/checkout@v4                              # main's loop, even when a review started it
+        with: { ref: "${{ github.event.repository.default_branch }}", fetch-depth: 0, persist-credentials: false }
+
+      - name: room for the sandbox image
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: start harness-interface (no credentials in its environment)
+        run: |
+          uv tool install --python 3.13 "harness-interface[server] @ git+https://github.com/mrcloudchase/harness-interface@$HI_VERSION"
+          bin="$(uv tool dir --bin)"; echo "$bin" >> "$GITHUB_PATH"
+          HI_RUNTIME=docker HI_DATA_DIR="$RUNNER_TEMP/hi" nohup "$bin/harness-interface" > "$RUNNER_TEMP/hi.log" 2>&1 &
+          for i in $(seq 90); do curl -sf localhost:8000/sandboxes > /dev/null && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/hi.log"; exit 1
+
+      - name: the sandbox, and the author and the reviewer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # The default sandbox's image is published: pull it rather than build it.
+          tag="harness-interface/default:$(hi sandbox show default | jq -j .dockerfile | sha256sum | cut -c1-12)"
+          remote="ghcr.io/mrcloudchase/$tag"
+          if docker pull -q "$remote"; then docker tag "$remote" "$tag"
+          else hi sandbox show default | jq -j .dockerfile | docker build -q -t "$tag" -; fi
+          docker tag "$tag" harness-interface/default:base
+          # The agents' sandbox: the default, plus the project's .factory/sandbox.Dockerfile if it has one
+          # (FROM harness-interface/default:base), reaching the hosts in config.toml's `egress`.
+          if [ -f .factory/sandbox.Dockerfile ]; then cp .factory/sandbox.Dockerfile "$RUNNER_TEMP/sandbox"
+          else echo "FROM harness-interface/default:base" > "$RUNNER_TEMP/sandbox"; fi
+          egress=$(python3 -c 'import tomllib,pathlib; p=pathlib.Path(".factory/config.toml"); print(" ".join(tomllib.loads(p.read_text()).get("egress", []) if p.exists() else []))')
+          hi sandbox add project "$RUNNER_TEMP/sandbox" ${egress:+--egress $egress}
+          hi provider add anthropic --url https://api.anthropic.com --key-env ANTHROPIC_API_KEY
+          hi provider add openai --url https://api.openai.com/v1 --key-env OPENAI_API_KEY
+          # Two shipped harnesses, registered under their roles' names only, so neither agent learns
+          # which harness the other is. Each one's instructions go in its own home, so the project's
+          # AGENTS.md stays the project's.
+          hi harness add --builtin claude-code codex
+          register() {
+            hi harness show "$1" | jq --arg name "$2" --arg file "$3" --argjson timeout "$4" \
+              '.name = $name | .sandbox = "project" | .files = {($file): "{instructions}"} | .run.timeout_s = $timeout' \
+              | curl -sf -X PUT "localhost:8000/harnesses/$2" -H 'content-type: application/json' -d @- > /dev/null
+            hi harness rm "$1" > /dev/null
+          }
+          register claude-code author .home/.claude/CLAUDE.md 2700
+          register codex reviewer .home/.codex/AGENTS.md 1800
+          hi harness ls
+
+      - name: tick
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TASK: ${{ inputs.task || 'tick' }}
+        run: python3 .factory/loop.py "$TASK"
+
+      - name: keep every agent turn's record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: factory-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hi.log
+            ${{ runner.temp }}/hi/records
+            ${{ runner.temp }}/hi/logs
+          if-no-files-found: ignore
+          retention-days: 30
+
+  check:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.task == 'check')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency: { group: "factory-check-${{ github.head_ref || github.ref }}", cancel-in-progress: true }
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha || github.sha }}", persist-credentials: false }
+      - uses: astral-sh/setup-uv@v5
+      - name: the factory's own tests, then the project's checks
+        run: |
+          set +e
+          { python3 -m unittest discover -s .factory/tests -q && bash .factory/check; } > "$RUNNER_TEMP/check.log" 2>&1
+          code=$?
+          cat "$RUNNER_TEMP/check.log"
+          if [ $code -ne 0 ]; then   # the end of the output, as an annotation the loop can read back
+            tail -c 6000 "$RUNNER_TEMP/check.log" | python3 -c 'import sys; t=sys.stdin.read().replace("%","%25").replace("\r","%0D").replace("\n","%0A"); print("::error title=check failed::"+t)'
+          fi
+          exit $code
+
+  next:
+    needs: check
+    if: always() && vars.FACTORY_ENABLED == 'true' && needs.check.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions: { actions: write }
+    steps:
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh workflow run factory.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}" -f task=tick
