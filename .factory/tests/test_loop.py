@@ -38,7 +38,7 @@ class FakeGitHub:
     def __init__(self, origin: Path, clock: Clock, owner="owner"):
         self.origin, self.clock, self.owner = origin, clock, owner
         self.ids = itertools.count(1)
-        self.items, self.comments_ = {}, []
+        self.items, self.comments_, self.line_comments = {}, [], []
         self.statuses, self.checks, self.reviews_ = {}, {}, {}
         self.dispatched, self.merged, self.requested, self.reactions = [], [], [], []
 
@@ -77,11 +77,24 @@ class FakeGitHub:
     def comments(self, n):
         return [c for c in self.comments_ if c["issue_url"].endswith(f"/{n}")]
 
-    def owner_comments(self, login, since):
-        return [c for c in self.comments_ if c["user"]["login"] == login and c["created_at"] > since]
+    def line_comment(self, n, path, line, body, user="owner"):
+        self.line_comments.append({"id": next(self.ids) + 20_000, "n": n, "path": path, "line": line, "body": body,
+                                   "user": {"login": user}, "created_at": self._now()})
 
-    def react(self, what, number):
-        self.reactions.append((what, number))
+    def owner_words(self, login, since):
+        words = [{"n": int(c["issue_url"].rsplit("/", 1)[1]), "pr": "/pull/" in c["html_url"], "text": c["body"],
+                  "at": c["created_at"], "react": f"/issues/comments/{c['id']}"}
+                 for c in self.comments_ if c["user"]["login"] == login and c["created_at"] > since]
+        words += [{"n": c["n"], "pr": True, "text": f"(on {c['path']}, line {c['line']}) {c['body']}",
+                   "at": c["created_at"], "react": f"/pulls/comments/{c['id']}"}
+                  for c in self.line_comments if c["user"]["login"] == login and c["created_at"] > since]
+        words += [{"n": n, "pr": True, "text": r["body"], "at": r["submitted_at"], "react": ""}
+                  for n, rs in self.reviews_.items() for r in rs
+                  if r["user"]["login"] == login and r["body"] and r["submitted_at"] > since]
+        return sorted(words, key=lambda w: w["at"])
+
+    def react(self, path):
+        self.reactions.append(path)
 
     def add_labels(self, n, labels):
         have = {x["name"] for x in self.items[int(n)]["labels"]}
@@ -134,8 +147,9 @@ class FakeGitHub:
     def reviews(self, n):
         return self.reviews_.get(int(n), [])
 
-    def review(self, n, login, state, sha):
-        self.reviews_.setdefault(int(n), []).append({"user": {"login": login}, "state": state, "commit_id": sha})
+    def review(self, n, login, state, sha, body=""):
+        self.reviews_.setdefault(int(n), []).append({"user": {"login": login}, "state": state, "commit_id": sha,
+                                                     "body": body, "submitted_at": self._now()})
 
     def request_review(self, n, login):
         self.requested.append((n, login))
@@ -410,6 +424,37 @@ class TheOwner(Base):
         self.assertEqual(self.gh.status(pr["head"]["sha"], loop.REVIEW)[0], "failure")
         f.tick()
         self.assertIn("Call it subtract", self.agents.turns[-1]["text"])
+
+    def test_the_owners_line_comments_and_review_text_are_review_too(self):
+        self.ready()
+        f = self.factory(script(author=[ADD, {"files": {"src/app.py": "# renamed\n"}, "result": {"summary": "renamed"}}]))
+        f.tick()
+        pr = self.the_pr()
+        self.gh.finish_check(pr["head"]["sha"], "success")
+        self.clock.advance(minutes=5)
+        self.gh.line_comment(pr["number"], "src/app.py", 3, "No magic numbers here.")
+        self.gh.review(pr["number"], "owner", "CHANGES_REQUESTED", pr["head"]["sha"], body="Needs a test.")
+        f.tick()
+        self.assertEqual(self.gh.status(pr["head"]["sha"], loop.REVIEW)[0], "failure")
+        self.assertTrue(any(r.startswith("/pulls/comments/") for r in self.gh.reactions))    # 👀 on the line comment
+        f.tick()
+        fix = self.agents.turns[-1]["text"]
+        self.assertIn("(on src/app.py, line 3) No magic numbers here.", fix)
+        self.assertIn("Needs a test.", fix)
+
+    def test_a_comment_on_a_closed_pull_request_is_answered_there(self):
+        pr = self.gh.create_issue("app: old", "done", [])                     # a merged one: its branch is gone
+        pr.update(pull_request={}, state="closed", head={"ref": "factory/9", "sha": "x"}, base={"ref": "main"})
+        f = self.factory(script(author=[{"result": {"no_op": "x"}},
+                                        {"result": {"replies": [{"number": pr["number"], "text": "Opened #10 for it."}]}}]))
+        f.tick()
+        self.clock.advance(minutes=5)
+        self.gh.comment(pr["number"], "This broke the build on macOS.", user="owner")
+        f.tick()
+        steer = self.agents.turns[-1]["text"]
+        self.assertIn("This broke the build on macOS.", steer)
+        self.assertIn("(pull request, closed", steer)
+        self.assertIn("Opened #10 for it.", self.gh.comments(pr["number"])[-1]["body"])
 
 
 class Brakes(Base):

@@ -27,19 +27,18 @@ other only as "the author" and "the reviewer".
 - The repository's settings and secrets (see the setup in the root README).
 
 **How you send input.** The factory reads everything you write, and only what you write (comments by
-anyone else are ignored). It reads it on its next tick: at once while it is running, otherwise when you
-next start it.
+anyone else are ignored), and whatever you write starts a tick.
 
 | To | Do this | What happens |
 |---|---|---|
 | change direction | edit `VISION.md` and push | the next tick plans against the new vision |
 | ask for something | open an issue, in plain words | the author turns it into planned work and answers you on it |
-| say anything | comment on any issue, including the digest and the home issue | the author acts on it and answers in that thread; a 👀 shows it was read |
-| change a pull request | comment on it | that counts as review: the author must address it before it can merge |
+| say anything | comment on any issue or pull request, open or closed, including the digest and the home issue | the author acts on it and answers in that thread; a 👀 shows it was read |
+| change a pull request | comment on it or on its lines, or review it with *Request changes* | that counts as review: the author must address it before it can merge |
 | approve your paths | approve the pull request | it merges at the next tick |
 | skip the plan review | add the label `factory:ready` to an issue | the author builds it next |
 | stop something | close the issue or pull request | the factory leaves it alone |
-| start it | Actions → factory → Run workflow | it works until there is nothing to do or it needs you |
+| start it | Actions → factory → Run workflow (anything above also starts it) | it works until there is nothing to do or it needs you |
 | pause everything | set the repository variable `FACTORY_ENABLED` to anything but `true` | nothing runs until you set it back |
 | get a digest now | Actions → factory → Run workflow, task `digest` | it is written at once |
 
@@ -85,9 +84,9 @@ itself refuses workflow changes from the workflow's token.
 ## The loop
 
 Each tick does the first of these that applies, then exits; when it did something, the next tick starts
-at once. Ticks never overlap. **You start it:** Actions → factory → Run workflow. One start runs until
-there is nothing to do, it needs you, or a brake stops it; then it waits for your next start. (To run on
-its own, every hour and whenever you write, uncomment the `auto` lines in `factory.yml`.)
+at once. Ticks never overlap. **You start it:** Run workflow, or open an issue, or write anything on an
+issue or pull request. One start runs until there is nothing to do, it needs you, or a brake stops it;
+then it waits for you. (To also run on its own every hour, uncomment the `auto` lines in `factory.yml`.)
 
 1. **You wrote something new:** the author acts on it and answers you.
 2. **`main`'s check failed:** an urgent fix issue, built before anything else.

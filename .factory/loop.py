@@ -2,7 +2,7 @@
 
 Each tick (one run of .github/workflows/factory.yml) reads the repository's state from GitHub, does the
 first thing on this list that applies, records it, and exits. When it did something it starts the next
-tick at once; otherwise it waits for the next start (see factory.yml). Ticks never overlap.
+tick at once; otherwise it waits for the owner (see factory.yml). Ticks never overlap.
 
     1. the owner wrote something new             the author acts on it and answers
     2. main's check failed                       an urgent fix
@@ -149,16 +149,28 @@ class GitHub:
     def comment(self, n: int, body: str) -> None:
         self.call("POST", self._r(f"/issues/{n}/comments"), {"body": body})
 
-    def owner_comments(self, login: str, since: str) -> list:
-        """Every comment `login` made on any issue or pull request after `since`, oldest first."""
-        found = self._pages(f"/issues/comments?since={since}&sort=created&direction=asc")
-        return [c for c in found if c["user"]["login"] == login and c["created_at"] > since]
+    def owner_words(self, login: str, since: str) -> list:
+        """Everything `login` wrote after `since`, oldest first, as {n, pr, text, at, react}: comments on any issue
+        or pull request in any state, comments on a pull request's lines, and the text of reviews of open ones."""
+        def mine(c):
+            return c["user"]["login"] == login and c["created_at"] > since
+        words = [{"n": int(c["issue_url"].rsplit("/", 1)[1]), "pr": "/pull/" in c["html_url"], "text": c["body"],
+                  "at": c["created_at"], "react": f"/issues/comments/{c['id']}"}
+                 for c in self._pages(f"/issues/comments?since={since}&sort=created&direction=asc") if mine(c)]
+        words += [{"n": int(c["pull_request_url"].rsplit("/", 1)[1]), "pr": True, "at": c["created_at"],
+                   "text": f"(on {c['path']}, line {c.get('line') or c.get('original_line')}) {c['body']}",
+                   "react": f"/pulls/comments/{c['id']}"}
+                  for c in self._pages(f"/pulls/comments?since={since}&sort=created&direction=asc") if mine(c)]
+        for p in self.pulls():
+            words += [{"n": p["number"], "pr": True, "text": r["body"], "at": r["submitted_at"], "react": ""}
+                      for r in self.reviews(p["number"]) if r["user"]["login"] == login and r.get("body")
+                      and r["state"] in ("CHANGES_REQUESTED", "COMMENTED") and (r.get("submitted_at") or "") > since]
+        return sorted(words, key=lambda w: w["at"])
 
-    def react(self, what: str, number: int) -> None:
-        """👀 on a comment ("comment") or an issue ("issue"): the owner sees it was read."""
-        path = f"/issues/comments/{number}/reactions" if what == "comment" else f"/issues/{number}/reactions"
+    def react(self, path: str) -> None:
+        """👀 on a comment or an issue (its API path): the owner sees it was read."""
         try:
-            self.call("POST", self._r(path), {"content": "eyes"})
+            self.call("POST", self._r(f"{path}/reactions"), {"content": "eyes"})
         except GitHubError:
             pass                                      # a courtesy; the cursor is what counts
 
@@ -455,45 +467,40 @@ class Factory:
     # 1. the owner
     def steer(self) -> bool:
         since = self.state["cursor"]
-        comments = self.gh.owner_comments(self.owner, since)
+        words = self.gh.owner_words(self.owner, since)
         opened = [i for i in self.gh.issues(state="all", creator=self.owner, since=since) if i["created_at"] > since
                   and not any(label["name"].startswith("factory:") for label in i.get("labels", []))]
-        if not comments and not opened:
+        if not words and not opened:
             return False
-        said = []
-        for c in comments:
-            n = int(c["issue_url"].rsplit("/", 1)[1])
-            if "/pull/" in c["html_url"]:
-                self.pr_feedback(n, c["body"])
-            else:
-                said.append((n, c["body"]))
+        said = [(w["n"], w["text"]) for w in words if not (w["pr"] and self.pr_feedback(w["n"], w["text"]))]
         said += [(i["number"], f"(a new issue) {i['title']}\n\n{i.get('body') or ''}") for i in opened]
         if said:
             self.act_on_owner(said)
-        for c in comments:
-            self.gh.react("comment", c["id"])
-        for i in opened:
-            self.gh.react("issue", i["number"])
-        self.state["cursor"] = max(x["created_at"] for x in [*comments, *opened])
+        for path in [w["react"] for w in words if w["react"]] + [f"/issues/{i['number']}" for i in opened]:
+            self.gh.react(path)
+        self.state["cursor"] = max([w["at"] for w in words] + [i["created_at"] for i in opened])
         return True
 
-    def pr_feedback(self, number: int, text: str) -> None:
-        """The owner commented on one of the factory's pull requests: that is review the author must address."""
+    def pr_feedback(self, number: int, text: str) -> bool:
+        """The owner wrote on one of the factory's open pull requests: that is review the author must address.
+        Anywhere else (a closed one, the owner's own) it is conversation, answered like any other."""
         pr = next((p for p in self.gh.pulls() if p["number"] == number), None)
         if not pr or not pr["head"]["ref"].startswith("factory/"):
-            return                                    # the owner's own pull requests are the owner's business
+            return False
         n = int(pr["head"]["ref"].split("/", 1)[1])
         self.state["feedback"][str(n)] = f"{self.state['feedback'].get(str(n), '')}\n\nThe owner: {text}".strip()
         self.state["attempts"].pop(str(n), None)
         self.gh.remove_label(number, "factory:needs-owner")
         self.gh.set_status(pr["head"]["sha"], REVIEW, "failure", "The owner asked for changes")
+        return True
 
     def act_on_owner(self, said: list) -> None:
         threads = []
         for n, text in said:
             issue = self.gh.issue(n)
-            labels = ", ".join(label["name"] for label in issue.get("labels", []))
-            threads.append(f"### On #{n}: {issue['title']} ({labels or 'no labels'})\n\n"
+            about = ", ".join([("pull request" if "pull_request" in issue else "issue"), issue.get("state", "open"),
+                               *(label["name"] for label in issue.get("labels", []))])
+            threads.append(f"### On #{n}: {issue['title']} ({about})\n\n"
                            f"{(issue.get('body') or '')[:3000]}\n\n**The owner wrote:** {text}")
         record = self.turn("author", f"""The owner, who decides this project's direction, wrote to you. Act on it: change
 the planned work to match (create issues, edit them, mark them ready, or close them), and answer the owner
